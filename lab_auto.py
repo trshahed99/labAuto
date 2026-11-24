@@ -11,7 +11,7 @@ RESTART_WAIT_MIN = 1       # Stop করার পর কত মিনিট অ
 EXTRA_TIME_MIN   = 9       # Restart-এর পর আরেকটা টাইম (শেষ হলে কাঙ্ক্ষিত টাইম শুরু)
 MAIN_TIME_MIN    = 50      # কাঙ্ক্ষিত মিনিট (এটা শেষ হলে আবার Stop)
 
-HEADLESS = False           # True দিলে ব্রাউজার দেখা যাবে না
+HEADLESS = True           # True দিলে ব্রাউজার দেখা যাবে না
 
 # ============================================================
 # 👇👇👇 এখানে Cookie-Editor থেকে কপি করা JSON পেস্ট করো 👇👇👇
@@ -146,7 +146,7 @@ async def wait_minutes(minutes, label):
 
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(channel="chrome", headless=HEADLESS)
+        browser = await p.chromium.launch(headless=HEADLESS)   # channel="chrome" বাদ
         context = await browser.new_context()
 
         cookies = load_cookies()
