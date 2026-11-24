@@ -4,18 +4,17 @@ from datetime import datetime, timedelta
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # ================== CONFIG ==================
-LAB_NAME = "rana"          # কার্ডে যে নামটা দেখা যায়
+LAB_NAME = "My First VM"          # কার্ডে যে নামটা দেখা যায়
 
 START_WITH_STOP  = True    # True = চালু হওয়ার সাথে সাথেই Stop দিয়ে শুরু
 RESTART_WAIT_MIN = 1       # Stop করার পর কত মিনিট অপেক্ষা করে Restart করবে
 EXTRA_TIME_MIN   = 9       # Restart-এর পর আরেকটা টাইম (শেষ হলে কাঙ্ক্ষিত টাইম শুরু)
 MAIN_TIME_MIN    = 50      # কাঙ্ক্ষিত মিনিট (এটা শেষ হলে আবার Stop)
 
-HEADLESS = True           # True দিলে ব্রাউজার দেখা যাবে না
+HEADLESS = True            # Daytona-তে ব্যাকগ্রাউন্ডে চলার জন্য এটি True থাকতেই হবে
 
 # ============================================================
 # 👇👇👇 এখানে Cookie-Editor থেকে কপি করা JSON পেস্ট করো 👇👇👇
-# (নিচের ''' আর ''' এর মাঝখানে, [ ] সহ পুরোটা বসাও)
 # ============================================================
 COOKIES_JSON = r'''
 [
@@ -34,8 +33,6 @@ COOKIES_JSON = r'''
     }
 ]
 '''
-# ============================================================
-# 👆👆👆 কুকি পেস্ট করার জায়গা এখানে শেষ 👆👆👆
 # ============================================================
 
 LOGIN_URL = "https://labs.2z2.top/login"
@@ -146,7 +143,8 @@ async def wait_minutes(minutes, label):
 
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)   # channel="chrome" বাদ
+        # Daytona-তে Chromium ব্যবহারের জন্য channel বাদ দেওয়া হয়েছে
+        browser = await p.chromium.launch(headless=HEADLESS)
         context = await browser.new_context()
 
         cookies = load_cookies()
