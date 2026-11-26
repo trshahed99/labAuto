@@ -41,7 +41,7 @@ from telegram.ext import (
 # ⚙️ বেসিক কনফিগ (টোকেন কোডে লিখো না, environment-এ রাখো)
 # ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "9097454535:AAFmnesxWwWoKsp5CXvoByIVMCnzamOlunE")
-OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+OWNER_ID = int(os.getenv("OWNER_ID", "8853172010") or 0)
 DB_NAME = os.getenv("DB_NAME", "lab_config.db")
 DASH_URL = "https://labs.2z2.top/dashboard"
 
