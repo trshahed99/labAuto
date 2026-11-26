@@ -1,49 +1,46 @@
 """
-Lab Auto Manager
-----------------
-Telegram বট দিয়ে নিয়ন্ত্রিত Playwright অটোমেশন।
-- Playwright ON/OFF সুইচ (ডিফল্ট: OFF)
-- সব সেটিং টেলিগ্রাম মেনু থেকে বদলানো যায়
-- শুধু OWNER_ID-র মালিক বট চালাতে পারবেন
-- গুরুত্বপূর্ণ ঘটনায় টেলিগ্রামে নোটিফিকেশন আসে
+Lab Auto Manager (Web)
+----------------------
+টেলিগ্রামের বদলে ওয়েব ড্যাশবোর্ড। Cloudflare Tunnel দিয়ে নিজের ডোমেইনে খোলা যায়।
 
-চালানোর আগে (টার্মিনালে):
-    pip install playwright python-telegram-bot
+- Playwright ON/OFF সুইচ (ডিফল্ট: OFF)
+- পাসওয়ার্ড দিয়ে লগইন (DASH_PASSWORD)
+- সেটিং, কুকি, লাইভ স্ট্যাটাস ও লগ ওয়েবপেজ থেকেই
+- সার্ভার শুধু 127.0.0.1-এ শোনে, বাইরে থেকে ঢোকার একমাত্র পথ Tunnel
+
+চালানোর আগে:
+    pip install -r requirements.txt
     playwright install --with-deps chromium
-    export TELEGRAM_TOKEN="BotFather-এর টোকেন"
-    export OWNER_ID="তোমার টেলিগ্রাম ইউজার আইডি"
-    python3 lab_bot.py
+    export DASH_PASSWORD="একটা শক্ত পাসওয়ার্ড"
+    python3 lab_web.py
 """
 
 import asyncio
-import html
-import io
+import collections
+import hmac
 import json
 import os
-import signal
+import secrets
 import sqlite3
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
-from telegram.error import BadRequest
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from playwright.async_api import TimeoutError as PWTimeout
+from playwright.async_api import async_playwright
 
 # ==========================================
-# ⚙️ বেসিক কনফিগ (টোকেন কোডে লিখো না, environment-এ রাখো)
+# ⚙️ বেসিক কনফিগ
 # ==========================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "9097454535:AAFmnesxWwWoKsp5CXvoByIVMCnzamOlunE")
-OWNER_ID = int(os.getenv("OWNER_ID", "8853172010") or 0)
+DASH_PASSWORD = os.getenv("DASH_PASSWORD", "742422")
+HOST = os.getenv("HOST", "127.0.0.1")
+PORT = int(os.getenv("PORT", "8000"))
 DB_NAME = os.getenv("DB_NAME", "lab_config.db")
 DASH_URL = "https://labs.2z2.top/dashboard"
+SESSION_TTL = 12 * 3600
 
 DEFAULTS = {
     "LAB_NAME": "rana",
@@ -54,16 +51,8 @@ DEFAULTS = {
     "COOKIES_JSON": "[]",
     "AUTO_ENABLED": "False",  # ডিফল্ট OFF
 }
-
 INT_KEYS = {"RESTART_WAIT_MIN", "EXTRA_TIME_MIN", "MAIN_TIME_MIN"}
-LABELS = {
-    "LAB_NAME": "🏷 ল্যাবের নাম",
-    "COOKIES_JSON": "🍪 কুকি",
-    "START_WITH_STOP": "🛑 শুরুতেই Stop",
-    "RESTART_WAIT_MIN": "⏱ Restart-এর আগে বিরতি (মিনিট)",
-    "EXTRA_TIME_MIN": "➕ অতিরিক্ত টাইম (মিনিট)",
-    "MAIN_TIME_MIN": "🎯 কাঙ্ক্ষিত টাইম (মিনিট)",
-}
+EDITABLE = {"LAB_NAME", "START_WITH_STOP", *INT_KEYS}
 
 
 def log(msg):
@@ -91,22 +80,26 @@ def set_config(key, value):
         conn.execute("INSERT OR REPLACE INTO configs (key, value) VALUES (?, ?)", (key, str(value)))
 
 
-def parse_value(key, text):
-    """ইউজারের পাঠানো মান যাচাই করে। ভুল হলে ValueError দেয়।"""
-    t = text.strip()
+def parse_value(key, value):
+    """মান যাচাই করে। ভুল হলে ValueError দেয়।"""
+    t = str(value).strip()
     if key in INT_KEYS:
         if not t.isdigit() or not (1 <= int(t) <= 1440):
-            raise ValueError("১ থেকে ১৪৪০-এর মধ্যে একটি সংখ্যা দিন।")
+            raise ValueError("সময় ১ থেকে ১৪৪০ মিনিটের মধ্যে একটি সংখ্যা হতে হবে।")
         return str(int(t))
     if key == "LAB_NAME":
-        if not t:
-            raise ValueError("নাম খালি হতে পারে না।")
+        if not t or len(t) > 100:
+            raise ValueError("ল্যাবের নাম খালি বা অতি দীর্ঘ হতে পারে না।")
         return t
+    if key == "START_WITH_STOP":
+        return "True" if t.lower() in ("true", "1", "yes", "on") else "False"
     if key == "COOKIES_JSON":
+        if len(t) > 200_000:
+            raise ValueError("কুকি ডাটা অনেক বড়।")
         try:
             data = json.loads(t)
         except json.JSONDecodeError:
-            raise ValueError("এটা সঠিক JSON নয়। Cookie-Editor থেকে Export করে পুরোটা পাঠান।")
+            raise ValueError("এটা সঠিক JSON নয়। Cookie-Editor থেকে Export করে পুরোটা দিন।")
         if not isinstance(data, list) or not data:
             raise ValueError("কুকির তালিকা ([ ... ]) দরকার।")
         for c in data:
@@ -117,7 +110,7 @@ def parse_value(key, text):
 
 
 # ==========================================
-# 🤖 Playwright অটোমেশন ফাংশন
+# 🤖 Playwright অটোমেশন
 # ==========================================
 class CookieExpired(Exception):
     pass
@@ -175,7 +168,6 @@ async def click_btn(page, lab_name, names, timeout=15000):
 
 
 async def stop_lab(page, lab_name):
-    """Stop করে। সফল হলে True।"""
     await ensure_dashboard(page)
     if not await click_btn(page, lab_name, ["Stop"]):
         return False
@@ -199,30 +191,24 @@ async def start_lab(page, lab_name):
     return await click_btn(page, lab_name, ["Start", "Restart", "Run"])
 
 
-# ==========================================
-# 🎛 Runner: Playwright ON/OFF নিয়ন্ত্রণ
-# ==========================================
 class Runner:
-    def __init__(self, app):
-        self.app = app
+    def __init__(self):
         self.task = None
         self.phase = "বন্ধ"
         self.next_at = None
         self.cycles = 0
         self.last_event = "-"
+        self.logs = collections.deque(maxlen=200)
 
     @property
     def running(self):
         return self.task is not None and not self.task.done()
 
-    async def notify(self, text):
-        self.last_event = f"{datetime.now():%H:%M} {text}"
+    def note(self, text):
+        line = f"{datetime.now():%H:%M:%S}  {text}"
+        self.logs.append(line)
+        self.last_event = line
         log(text)
-        if OWNER_ID:
-            try:
-                await self.app.bot.send_message(OWNER_ID, text, parse_mode=ParseMode.HTML)
-            except Exception as e:
-                log(f"নোটিফিকেশন পাঠানো যায়নি: {e}")
 
     async def start(self):
         if self.running:
@@ -242,18 +228,19 @@ class Runner:
         self.task = None
         self.phase = "বন্ধ"
         self.next_at = None
+        self.note("🔴 অটোমেশন বন্ধ করা হয়েছে")
 
     async def _wait(self, minutes, phase):
         self.phase = phase
         self.next_at = datetime.now() + timedelta(minutes=minutes)
-        log(f"⏳ {phase}: {minutes} মিনিট (শেষ {self.next_at:%H:%M:%S})")
+        self.note(f"⏳ {phase}: {minutes} মিনিট (শেষ {self.next_at:%H:%M:%S})")
         await asyncio.sleep(minutes * 60)
 
     async def _run(self):
         try:
             cookies = load_cookies()
             if not cookies:
-                await self.notify("❌ কুকি খালি। আগে কুকি সেট করুন, তারপর চালু করুন।")
+                self.note("❌ কুকি খালি। আগে কুকি সেট করুন, তারপর চালু করুন।")
                 set_config("AUTO_ENABLED", "False")
                 return
 
@@ -266,7 +253,7 @@ class Runner:
 
                 self.phase = "Dashboard-এ ঢুকছি"
                 await ensure_dashboard(page)
-                await self.notify("🟢 <b>অটোমেশন চালু হয়েছে</b>, Dashboard-এ ঢুকেছি ✅")
+                self.note("🟢 অটোমেশন চালু হয়েছে, Dashboard-এ ঢুকেছি ✅")
 
                 if get_config("START_WITH_STOP") != "True":
                     await self._wait(int(get_config("MAIN_TIME_MIN")), "কাঙ্ক্ষিত টাইম")
@@ -280,14 +267,14 @@ class Runner:
                     try:
                         self.phase = "Stop করছি"
                         ok = await stop_lab(page, lab)
-                        await self.notify("🛑 Stop সফল ✅" if ok else "⚠️ Stop নিশ্চিত হয়নি")
+                        self.note("🛑 Stop সফল ✅" if ok else "⚠️ Stop নিশ্চিত হয়নি")
 
                         await self._wait(restart_wait, "Restart-এর আগে বিরতি")
 
                         self.phase = "Restart করছি"
                         ok = await start_lab(page, lab)
                         self.cycles += 1
-                        await self.notify(
+                        self.note(
                             f"▶️ Restart ক্লিক হয়েছে (চক্র #{self.cycles})"
                             if ok
                             else "⚠️ Start বাটন পাইনি"
@@ -295,248 +282,360 @@ class Runner:
                     except CookieExpired:
                         raise
                     except Exception as e:
-                        await self.notify(f"❌ ত্রুটি: {html.escape(str(e))[:200]} (চক্র চলছে)")
+                        self.note(f"❌ ত্রুটি: {str(e)[:200]} (চক্র চলছে)")
 
                     await self._wait(extra, "অতিরিক্ত টাইম")
                     await self._wait(main, "কাঙ্ক্ষিত টাইম")
 
         except CookieExpired:
             set_config("AUTO_ENABLED", "False")
-            await self.notify("🔑 <b>কুকির মেয়াদ শেষ!</b> নতুন কুকি দিয়ে আবার চালু করুন। অটোমেশন বন্ধ হয়েছে।")
+            self.note("🔑 কুকির মেয়াদ শেষ! নতুন কুকি দিয়ে আবার চালু করুন। অটোমেশন বন্ধ হয়েছে।")
         except asyncio.CancelledError:
-            log("🔴 অটোমেশন বন্ধ করা হয়েছে")
             raise
         except Exception as e:
             set_config("AUTO_ENABLED", "False")
-            await self.notify(f"❌ <b>অটোমেশন থেমে গেছে:</b> {html.escape(str(e))[:300]}")
+            self.note(f"❌ অটোমেশন থেমে গেছে: {str(e)[:300]}")
         finally:
             self.phase = "বন্ধ"
             self.next_at = None
 
 
+runner = Runner()
+
 # ==========================================
-# 📱 টেলিগ্রাম বট
+# 🔐 লগইন ও সেশন
 # ==========================================
-def owner_only(fn):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id if update.effective_user else 0
-        if OWNER_ID and uid == OWNER_ID:
-            return await fn(update, context)
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                f"⛔ অনুমতি নেই।\nআপনার ID: {uid}\n(মালিক হলে এটাই OWNER_ID হিসেবে সেট করুন)"
-            )
-
-    return wrapper
+sessions = {}  # token -> expiry
+fails = {}  # ip -> [count, first_time]
 
 
-def render_menu(runner: Runner):
-    on = runner.running
-    cookies = json.loads(get_config("COOKIES_JSON") or "[]")
-    cookie_names = ", ".join(c.get("name", "?") for c in cookies) or "নেই"
-    nxt = f"{runner.next_at:%H:%M:%S}" if runner.next_at else "-"
-
-    text = (
-        "⚙️ <b>Lab Auto Manager</b>\n"
-        "━━━━━━━━━━━━━━\n"
-        f"অবস্থা: {'🟢 <b>ON</b>' if on else '🔴 <b>OFF</b>'}\n"
-        f"ধাপ: {html.escape(runner.phase)}\n"
-        f"পরবর্তী ঘটনা: {nxt}\n"
-        f"সম্পন্ন চক্র: {runner.cycles}\n"
-        f"শেষ ঘটনা: {html.escape(runner.last_event)}\n"
-        "━━━━━━━━━━━━━━\n"
-        f"🏷 ল্যাব: <code>{html.escape(get_config('LAB_NAME'))}</code>\n"
-        f"🛑 শুরুতেই Stop: <b>{'হ্যাঁ' if get_config('START_WITH_STOP') == 'True' else 'না'}</b>\n"
-        f"⏱ বিরতি: {get_config('RESTART_WAIT_MIN')} মি | "
-        f"➕ অতিরিক্ত: {get_config('EXTRA_TIME_MIN')} মি | "
-        f"🎯 কাঙ্ক্ষিত: {get_config('MAIN_TIME_MIN')} মি\n"
-        f"🍪 কুকি: {len(cookies)}টি ({html.escape(cookie_names)})"
-    )
-    toggle = (
-        InlineKeyboardButton("⏹ বন্ধ করুন (OFF)", callback_data="toggle")
-        if on
-        else InlineKeyboardButton("▶️ চালু করুন (ON)", callback_data="toggle")
-    )
-    sws = "✅" if get_config("START_WITH_STOP") == "True" else "❌"
-    kb = InlineKeyboardMarkup(
-        [
-            [toggle],
-            [InlineKeyboardButton("🔄 রিফ্রেশ", callback_data="refresh")],
-            [
-                InlineKeyboardButton(LABELS["LAB_NAME"], callback_data="edit_LAB_NAME"),
-                InlineKeyboardButton(LABELS["COOKIES_JSON"], callback_data="edit_COOKIES_JSON"),
-            ],
-            [InlineKeyboardButton(f"{LABELS['START_WITH_STOP']} {sws}", callback_data="toggle_sws")],
-            [InlineKeyboardButton(LABELS["RESTART_WAIT_MIN"], callback_data="edit_RESTART_WAIT_MIN")],
-            [InlineKeyboardButton(LABELS["EXTRA_TIME_MIN"], callback_data="edit_EXTRA_TIME_MIN")],
-            [InlineKeyboardButton(LABELS["MAIN_TIME_MIN"], callback_data="edit_MAIN_TIME_MIN")],
-        ]
-    )
-    return text, kb
+def client_ip(request: Request):
+    return request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "?")
 
 
-async def safe_edit(query, text, markup=None):
-    try:
-        await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            raise
+def is_authed(request: Request):
+    token = request.cookies.get("lab_session")
+    exp = sessions.get(token)
+    if exp and exp > time.time():
+        return True
+    sessions.pop(token, None)
+    return False
 
 
-async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"আপনার ইউজার ID: {update.effective_user.id}")
-
-
-@owner_only
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("editing", None)
-    text, kb = render_menu(context.application.bot_data["runner"])
-    await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-
-@owner_only
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    runner: Runner = context.application.bot_data["runner"]
-    data = query.data
-
-    if data == "toggle":
-        if runner.running:
-            await runner.stop()
-        else:
-            await runner.start()
-            await asyncio.sleep(1)
-    elif data == "toggle_sws":
-        cur = get_config("START_WITH_STOP") == "True"
-        set_config("START_WITH_STOP", "False" if cur else "True")
-    elif data.startswith("edit_"):
-        key = data[5:]
-        if key not in LABELS:
-            return
-        context.user_data["editing"] = key
-        if key == "COOKIES_JSON":
-            prompt = (
-                "🍪 Cookie-Editor থেকে <b>Export</b> করা JSON পুরোটা পাঠান "
-                "(লেখা হিসেবে অথবা .json ফাইল হিসেবে)।\n"
-                "নিরাপত্তার জন্য পাঠানো মেসেজটা আমি মুছে দেব।"
-            )
-        else:
-            prompt = (
-                f"📝 <b>{LABELS[key]}</b>\n"
-                f"বর্তমান মান: <code>{html.escape(get_config(key))}</code>\n\n"
-                "নতুন মান লিখে পাঠান (বাতিল করতে /start):"
-            )
-        await safe_edit(query, prompt)
-        return
-
-    text, kb = render_menu(runner)
-    await safe_edit(query, text, kb)
-
-
-async def _apply_edit(update, context, raw_text):
-    key = context.user_data.get("editing")
-    try:
-        value = parse_value(key, raw_text)
-    except ValueError as e:
-        await update.effective_message.reply_text(f"⚠️ {e}\nআবার পাঠান, অথবা /start দিয়ে বাতিল করুন।")
-        return
-    set_config(key, value)
-    context.user_data.pop("editing", None)
-
-    # কুকির মেসেজ চ্যাটে রেখে দেওয়া ঠিক নয়
-    if key == "COOKIES_JSON":
-        try:
-            await update.effective_message.delete()
-        except Exception:
-            pass
-
-    runner: Runner = context.application.bot_data["runner"]
-    note = "✅ আপডেট হয়েছে।"
-    if runner.running and key in ("COOKIES_JSON", "LAB_NAME"):
-        note += " (কুকি/নাম কার্যকর হবে OFF করে আবার ON করলে)"
-    elif runner.running:
-        note += " (পরের চক্র থেকে কার্যকর)"
-    text, kb = render_menu(runner)
-    await update.effective_chat.send_message(note + "\n\n" + text, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-
-@owner_only
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "editing" in context.user_data:
-        await _apply_edit(update, context, update.message.text)
-    else:
-        await update.message.reply_text("মেনু খুলতে /start দিন।")
-
-
-@owner_only
-async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("editing") != "COOKIES_JSON":
-        await update.message.reply_text("আগে মেনু থেকে 🍪 কুকি বেছে নিন।")
-        return
-    doc = update.message.document
-    if doc.file_size and doc.file_size > 200_000:
-        await update.message.reply_text("⚠️ ফাইল অনেক বড়।")
-        return
-    buf = io.BytesIO()
-    f = await doc.get_file()
-    await f.download_to_memory(buf)
-    await _apply_edit(update, context, buf.getvalue().decode("utf-8", errors="ignore"))
+def require_auth(request: Request):
+    if not is_authed(request):
+        raise HTTPException(status_code=401, detail="লগইন করুন")
+    if request.method == "POST" and request.headers.get("x-requested-with") != "fetch":
+        raise HTTPException(status_code=403, detail="অনুরোধ বাতিল")
 
 
 # ==========================================
-# 🚀 মেইন
+# 🌐 ওয়েব অ্যাপ
 # ==========================================
-async def main():
-    if not TELEGRAM_TOKEN:
-        print("❌ TELEGRAM_TOKEN সেট করা নেই। export TELEGRAM_TOKEN=... দিন।")
-        return
-    if not OWNER_ID:
-        print("⚠️ OWNER_ID সেট করা নেই। বটে /id লিখে আপনার ID জেনে export OWNER_ID=... দিন।")
-
+@asynccontextmanager
+async def lifespan(app):
     init_db()
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    runner = Runner(app)
-    app.bot_data["runner"] = runner
-
-    app.add_handler(CommandHandler("id", cmd_id))
-    app.add_handler(CommandHandler(["start", "menu"], cmd_start))
-    app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    log("🤖 বট চালু হয়েছে (অটোমেশন ডিফল্টে OFF)")
-
-    # সার্ভার রিস্টার্টের পর আগের ON অবস্থা ফিরিয়ে আনা
     if get_config("AUTO_ENABLED") == "True":
         await runner.start()
-
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            pass
-    await stop_event.wait()
-
-    log("বন্ধ হচ্ছে...")
+    yield
     if runner.running:
         runner.task.cancel()
         try:
             await runner.task
         except (asyncio.CancelledError, Exception):
             pass
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
+
+
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return PAGE
+
+
+@app.post("/api/login")
+async def login(request: Request):
+    ip = client_ip(request)
+    count, first = fails.get(ip, [0, time.time()])
+    if time.time() - first > 900:
+        count, first = 0, time.time()
+    if count >= 5:
+        raise HTTPException(status_code=429, detail="অনেকবার ভুল হয়েছে। ১৫ মিনিট পর চেষ্টা করুন।")
+
+    body = await request.json()
+    pw = str(body.get("password", ""))
+    if not DASH_PASSWORD or not hmac.compare_digest(pw.encode(), DASH_PASSWORD.encode()):
+        fails[ip] = [count + 1, first]
+        await asyncio.sleep(1)
+        raise HTTPException(status_code=401, detail="পাসওয়ার্ড ভুল")
+
+    fails.pop(ip, None)
+    token = secrets.token_urlsafe(32)
+    sessions[token] = time.time() + SESSION_TTL
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        "lab_session",
+        token,
+        max_age=SESSION_TTL,
+        httponly=True,
+        samesite="strict",
+        secure=request.headers.get("x-forwarded-proto") == "https",
+    )
+    return resp
+
+
+@app.post("/api/logout")
+async def logout(request: Request):
+    sessions.pop(request.cookies.get("lab_session"), None)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie("lab_session")
+    return resp
+
+
+@app.get("/api/status")
+async def status(request: Request):
+    require_auth(request)
+    cookies = json.loads(get_config("COOKIES_JSON") or "[]")
+    next_in = None
+    if runner.next_at:
+        next_in = max(0, int((runner.next_at - datetime.now()).total_seconds()))
+    return {
+        "running": runner.running,
+        "phase": runner.phase,
+        "next_in": next_in,
+        "next_at": f"{runner.next_at:%H:%M:%S}" if runner.next_at else None,
+        "cycles": runner.cycles,
+        "last_event": runner.last_event,
+        "settings": {k: get_config(k) for k in EDITABLE},
+        "cookie_names": [c.get("name", "?") for c in cookies],
+        "logs": list(runner.logs)[-80:],
+    }
+
+
+@app.post("/api/toggle")
+async def toggle(request: Request):
+    require_auth(request)
+    if runner.running:
+        await runner.stop()
+    else:
+        await runner.start()
+        await asyncio.sleep(0.5)
+    return {"running": runner.running}
+
+
+@app.post("/api/config")
+async def save_config(request: Request):
+    require_auth(request)
+    body = await request.json()
+    settings = body.get("settings", {})
+    clean = {}
+    try:
+        for k, v in settings.items():
+            if k not in EDITABLE:
+                raise ValueError("অজানা সেটিং।")
+            clean[k] = parse_value(k, v)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    for k, v in clean.items():
+        set_config(k, v)
+    return {"ok": True}
+
+
+@app.post("/api/cookies")
+async def save_cookies(request: Request):
+    require_auth(request)
+    body = await request.json()
+    try:
+        value = parse_value("COOKIES_JSON", body.get("json", ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    set_config("COOKIES_JSON", value)
+    return {"ok": True, "count": len(json.loads(value))}
+
+
+PAGE = r"""<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab Auto Manager</title>
+<style>
+  :root{--bg:#0b0f14;--card:#121923;--line:#1f2a38;--txt:#e6edf3;--mut:#8b9bb0;--green:#22c55e;--red:#ef4444;--blue:#3b82f6}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.5 system-ui,-apple-system,"Noto Sans Bengali",sans-serif}
+  .wrap{max-width:860px;margin:0 auto;padding:16px}
+  header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
+  h1{font-size:18px;margin:0} .pill{padding:4px 12px;border-radius:999px;font-weight:700;font-size:13px}
+  .on{background:#0f2e1a;color:var(--green)} .off{background:#331416;color:var(--red)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
+  .card h2{font-size:14px;color:var(--mut);margin:0 0 12px;font-weight:600;letter-spacing:.3px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+  .stat{background:#0e141c;border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  .stat small{color:var(--mut);display:block} .stat b{font-size:17px;word-break:break-word}
+  button{font:inherit;cursor:pointer;border:0;border-radius:10px;padding:10px 16px;color:#fff;background:var(--blue);font-weight:600}
+  button.big{width:100%;padding:16px;font-size:17px} button.go{background:var(--green)} button.stop{background:var(--red)}
+  button.ghost{background:#1b2533;color:var(--txt)} button:disabled{opacity:.5}
+  label{display:block;color:var(--mut);font-size:13px;margin:10px 0 4px}
+  input[type=text],input[type=number],input[type=password],textarea{width:100%;background:#0e141c;border:1px solid var(--line);color:var(--txt);border-radius:10px;padding:10px;font:inherit}
+  textarea{min-height:110px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
+  .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+  .chk{display:flex;align-items:center;gap:8px;margin-top:12px;color:var(--txt)}
+  .chk input{width:18px;height:18px}
+  #logs{background:#070a0e;border:1px solid var(--line);border-radius:10px;padding:10px;height:220px;overflow:auto;font:12px/1.6 ui-monospace,Menlo,monospace;white-space:pre-wrap}
+  #toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#1b2533;border:1px solid var(--line);padding:10px 16px;border-radius:10px;opacity:0;transition:.25s;pointer-events:none;max-width:90%}
+  #toast.show{opacity:1} #login{max-width:360px;margin:12vh auto}
+  .hide{display:none!important} .mut{color:var(--mut);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div id="login" class="card hide">
+    <h1 style="margin-bottom:12px">🔐 Lab Auto Manager</h1>
+    <label>পাসওয়ার্ড</label>
+    <input id="pw" type="password" autocomplete="current-password">
+    <button id="loginBtn" style="width:100%;margin-top:14px">লগইন</button>
+  </div>
+
+  <div id="app" class="hide">
+    <header>
+      <h1>⚙️ Lab Auto Manager</h1>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="pill" class="pill off">OFF</span>
+        <button class="ghost" id="logoutBtn">লগআউট</button>
+      </div>
+    </header>
+
+    <div class="card">
+      <button id="toggle" class="big go">▶️ চালু করুন (ON)</button>
+    </div>
+
+    <div class="card">
+      <h2>লাইভ অবস্থা</h2>
+      <div class="grid">
+        <div class="stat"><small>ধাপ</small><b id="phase">-</b></div>
+        <div class="stat"><small>পরের ঘটনা</small><b id="countdown">-</b></div>
+        <div class="stat"><small>সম্পন্ন চক্র</small><b id="cycles">0</b></div>
+        <div class="stat"><small>কুকি</small><b id="cookieCount">0টি</b></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>সেটিংস <span class="mut">(পরের চক্র থেকে কার্যকর)</span></h2>
+      <div class="row">
+        <div><label>ল্যাবের নাম</label><input id="LAB_NAME" type="text"></div>
+        <div><label>Restart-এর আগে বিরতি (মিনিট)</label><input id="RESTART_WAIT_MIN" type="number" min="1"></div>
+        <div><label>অতিরিক্ত টাইম (মিনিট)</label><input id="EXTRA_TIME_MIN" type="number" min="1"></div>
+        <div><label>কাঙ্ক্ষিত টাইম (মিনিট)</label><input id="MAIN_TIME_MIN" type="number" min="1"></div>
+      </div>
+      <label class="chk"><input id="START_WITH_STOP" type="checkbox"> চালু হওয়ার সাথে সাথেই Stop দিয়ে শুরু</label>
+      <button id="saveSettings" style="margin-top:14px">💾 সেভ করুন</button>
+    </div>
+
+    <div class="card">
+      <h2>🍪 কুকি</h2>
+      <div class="mut" id="cookieNames" style="margin-bottom:8px"></div>
+      <textarea id="cookieJson" placeholder="Cookie-Editor থেকে Export করা JSON এখানে পেস্ট করুন"></textarea>
+      <button id="saveCookies" style="margin-top:10px">🍪 কুকি সেভ করুন</button>
+      <div class="mut" style="margin-top:8px">সেভের পর কুকির মান আর দেখানো হয় না। নতুন কুকি কার্যকর করতে OFF করে আবার ON করুন।</div>
+    </div>
+
+    <div class="card">
+      <h2>লগ</h2>
+      <div id="logs"></div>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let formLoaded = false, nextAt = null, timer = null;
+
+function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2600);}
+
+async function api(path, body){
+  const opt = body === undefined ? {} :
+    {method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'fetch'}, body:JSON.stringify(body)};
+  const r = await fetch(path, opt);
+  if (r.status === 401 && path !== '/api/login') { showLogin(); throw new Error('auth'); }
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.detail || 'ত্রুটি হয়েছে');
+  return d;
+}
+
+function showLogin(){ $('#app').classList.add('hide'); $('#login').classList.remove('hide'); formLoaded=false; }
+function showApp(){ $('#login').classList.add('hide'); $('#app').classList.remove('hide'); }
+
+function fmt(s){ const m=Math.floor(s/60), r=s%60; return m+' মি '+String(r).padStart(2,'0')+' সে'; }
+function tick(){ $('#countdown').textContent = nextAt ? fmt(Math.max(0, Math.round((nextAt-Date.now())/1000))) : '-'; }
+
+async function refresh(){
+  let d;
+  try { d = await api('/api/status'); } catch(e){ return; }
+  showApp();
+  const pill = $('#pill'); pill.textContent = d.running ? 'ON' : 'OFF'; pill.className = 'pill ' + (d.running ? 'on' : 'off');
+  const tg = $('#toggle'); tg.textContent = d.running ? '⏹ বন্ধ করুন (OFF)' : '▶️ চালু করুন (ON)'; tg.className = 'big ' + (d.running ? 'stop' : 'go');
+  $('#phase').textContent = d.phase;
+  $('#cycles').textContent = d.cycles;
+  $('#cookieCount').textContent = d.cookie_names.length + 'টি';
+  $('#cookieNames').textContent = d.cookie_names.length ? 'বর্তমান কুকি: ' + d.cookie_names.join(', ') : 'কোনো কুকি সেট করা নেই';
+  nextAt = d.next_in === null ? null : Date.now() + d.next_in * 1000; tick();
+  if (!formLoaded) {
+    for (const k of ['LAB_NAME','RESTART_WAIT_MIN','EXTRA_TIME_MIN','MAIN_TIME_MIN']) $('#'+k).value = d.settings[k];
+    $('#START_WITH_STOP').checked = d.settings.START_WITH_STOP === 'True';
+    formLoaded = true;
+  }
+  const lg = $('#logs'); const atBottom = lg.scrollTop + lg.clientHeight >= lg.scrollHeight - 20;
+  lg.textContent = d.logs.join('\n'); if (atBottom) lg.scrollTop = lg.scrollHeight;
+}
+
+$('#loginBtn').onclick = async () => {
+  try { await api('/api/login', {password: $('#pw').value}); $('#pw').value=''; await refresh(); }
+  catch(e){ toast(e.message); }
+};
+$('#pw').addEventListener('keydown', e => { if (e.key === 'Enter') $('#loginBtn').click(); });
+$('#logoutBtn').onclick = async () => { await api('/api/logout', {}); showLogin(); };
+
+$('#toggle').onclick = async () => {
+  $('#toggle').disabled = true;
+  try { await api('/api/toggle', {}); await refresh(); } catch(e){ toast(e.message); }
+  $('#toggle').disabled = false;
+};
+
+$('#saveSettings').onclick = async () => {
+  const settings = {};
+  for (const k of ['LAB_NAME','RESTART_WAIT_MIN','EXTRA_TIME_MIN','MAIN_TIME_MIN']) settings[k] = $('#'+k).value;
+  settings.START_WITH_STOP = $('#START_WITH_STOP').checked ? 'True' : 'False';
+  try { await api('/api/config', {settings}); toast('✅ সেটিংস সেভ হয়েছে'); } catch(e){ toast('⚠️ ' + e.message); }
+};
+
+$('#saveCookies').onclick = async () => {
+  try {
+    const d = await api('/api/cookies', {json: $('#cookieJson').value});
+    $('#cookieJson').value = ''; toast('✅ ' + d.count + 'টি কুকি সেভ হয়েছে'); refresh();
+  } catch(e){ toast('⚠️ ' + e.message); }
+};
+
+refresh().then(() => { if ($('#app').classList.contains('hide')) showLogin(); });
+setInterval(refresh, 3000); setInterval(tick, 1000);
+</script>
+</body>
+</html>
+"""
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    if not DASH_PASSWORD or len(DASH_PASSWORD) < 8:
+        raise SystemExit("❌ DASH_PASSWORD সেট করুন (কমপক্ষে ৮ অক্ষর): export DASH_PASSWORD='...'")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
